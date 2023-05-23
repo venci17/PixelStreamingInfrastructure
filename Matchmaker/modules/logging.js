@@ -13,6 +13,10 @@ console.log = function(msg, ...args) {
 	});
 }
 
+console.error = function(msg, ...args) {
+	console.logColor(Red, msg, ...args);
+}
+
 console.logColor = function(color, msg, ...args) {
 	logColorFunctions.forEach((logColorFunction) => {
 		logColorFunction(color, msg, ...args);

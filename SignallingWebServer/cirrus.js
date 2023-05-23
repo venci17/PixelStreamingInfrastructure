@@ -2,6 +2,11 @@
 
 //-- Server side logic. Serves pixel streaming WebRTC-based page, proxies data back to Streamer --//
 
+// Microsoft Notes: This file has additions to the Unreal Engine Matchmaker that were done in conjuction with Epic to
+// add improved capabilities, resiliency and abilities to deploy and scale Pixel Streaming in Azure.
+// "MSFT Improvement" -- Areas where Microsoft have added additional code to what is exported out of Unreal Engine
+// "AZURE" -- Areas where Azure specific code was added (i.e., logging, metrics, etc.)
+
 var express = require('express');
 var app = express();
 
@@ -17,25 +22,29 @@ logging.RegisterConsoleLogger();
 const defaultConfig = {
 	UseFrontend: false,
 	UseMatchmaker: false,
-	UseHTTPS: false,
-	UseAuthentication: false,
+  enableHttps: false,
+  enableAuthentication: false,
 	LogToFile: true,
 	LogVerbose: true,
 	HomepageFile: 'player.html',
 	AdditionalRoutes: new Map(),
 	EnableWebserver: true,
-	MatchmakerAddress: "",
-	MatchmakerPort: "9999",
-	PublicIp: "localhost",
+  matchmakerAddress: "",
+  matchmakerPort: "9999",
+  publicIp: "localhost",
 	HttpPort: 80,
 	HttpsPort: 443,
-	StreamerPort: 8888,
-	SFUPort: 8889,
-	MaxPlayerCount: -1
+  streamerPort: 8888,
+  enableLifecycleManagement: false,
+  signallingServerPort: 80,
+  appInsightsInstrumentationKey: ""
 };
 
 const argv = require('yargs').argv;
-var configFile = (typeof argv.configFile != 'undefined') ? argv.configFile.toString() : path.join(__dirname, 'config.json');
+var configFile =
+  typeof argv.configFile != 'undefined'
+    ? argv.configFile.toString()
+    : path.join(__dirname, 'config.json');
 console.log(`configFile ${configFile}`);
 const config = require('./modules/config.js').init(configFile, defaultConfig);
 
@@ -43,15 +52,28 @@ if (config.LogToFile) {
 	logging.RegisterFileLogger('./logs');
 }
 
-console.log("Config: " + JSON.stringify(config, null, '\t'));
+/////////////////////////////// AZURE ///////////////////////////////
+// Add Azure Application Insights for logging / metrics
+const ai = require('./modules/ai.js');
+ai.init(config);
+if (config.enableLifecycleManagement) {
+  require('./modules/lifecycleCheck.js').init(config, ai);
+}
+/////////////////////////////////////////////////////////////////////
+
+console.log('Config: ' + JSON.stringify(config, null, '\t'));
 
 var http = require('http').Server(app);
 
-if (config.UseHTTPS) {
+if (config.enableHttps) {
 	//HTTPS certificate details
 	const options = {
-		key: fs.readFileSync(path.join(__dirname, './certificates/client-key.pem')),
-		cert: fs.readFileSync(path.join(__dirname, './certificates/client-cert.pem'))
+    key: fs.readFileSync(
+      path.join(__dirname, './certificates/client-key.pem')
+    ),
+    cert: fs.readFileSync(
+      path.join(__dirname, './certificates/client-cert.pem')
+    )
 	};
 
 	var https = require('https').Server(options, app);
@@ -60,13 +82,17 @@ if (config.UseHTTPS) {
 //If not using authetication then just move on to the next function/middleware
 var isAuthenticated = redirectUrl => function (req, res, next) { return next(); }
 
-if (config.UseAuthentication && config.UseHTTPS) {
+if (config.enableAuthentication && config.enableHttps) {
 	var passport = require('passport');
-	require('./modules/authentication').init(app);
+  require('./modules/authentication').init(app, config);
 	// Replace the isAuthenticated with the one setup on passport module
-	isAuthenticated = passport.authenticationMiddleware ? passport.authenticationMiddleware : isAuthenticated
-} else if (config.UseAuthentication && !config.UseHTTPS) {
-	console.error('Trying to use authentication without using HTTPS, this is not allowed and so authentication will NOT be turned on, please turn on HTTPS to turn on authentication');
+  isAuthenticated = passport.authenticationMiddleware
+    ? passport.authenticationMiddleware
+    : isAuthenticated;
+} else if (config.enableAuthentication && !config.enableHttps) {
+  console.error(
+    'Trying to use authentication without using HTTPS, this is not allowed and so authentication will NOT be turned on, please turn on HTTPS to turn on authentication'
+  );
 }
 
 const helmet = require('helmet');
@@ -88,8 +114,7 @@ if (config.UseFrontend) {
 	var httpsPort = config.HttpsPort;
 }
 
-var streamerPort = config.StreamerPort; // port to listen to Streamer connections
-var sfuPort = config.SFUPort;
+var streamerPort = config.streamerPort; // port to listen to Streamer connections
 
 var matchmakerAddress = '127.0.0.1';
 var matchmakerPort = 9999;
@@ -104,7 +129,11 @@ var serverPublicIp;
 // `clientConfig` is send to Streamer and Players
 // Example of STUN server setting
 // let clientConfig = {peerConnectionOptions: { 'iceServers': [{'urls': ['stun:34.250.222.95:19302']}] }};
-var clientConfig = { type: 'config', peerConnectionOptions: {} };
+var clientConfig = {
+  type: "config",
+  peerConnectionOptions: {},
+  appInsightsInstrumentationKey: config.appInsightsInstrumentationKey
+};
 
 // Parse public server address from command line
 // --publicIp <public address>
@@ -157,10 +186,15 @@ try {
 	}
 } catch (e) {
 	console.error(e);
+
+  /////////////////////////////// AZURE ///////////////////////////////
+  ai.logMetric('SignalingServerError', 1);
+  ai.logError(err);
+
 	process.exit(2);
 }
 
-if (config.UseHTTPS) {
+if (config.enableHttps) {
 	app.use(helmet());
 
 	app.use(hsts({
@@ -174,8 +208,8 @@ if (config.UseHTTPS) {
 			if (req.get('Host')) {
 				var hostAddressParts = req.get('Host').split(':');
 				var hostAddress = hostAddressParts[0];
-				if (httpsPort != 443) {
-					hostAddress = `${hostAddress}:${httpsPort}`;
+        if (config.signallingServerPort != 443) {
+          hostAddress = `${hostAddress}:${config.signallingServerPort}`;
 				}
 				return res.redirect(['https://', hostAddress, req.originalUrl].join(''));
 			} else {
@@ -190,7 +224,7 @@ if (config.UseHTTPS) {
 sendGameSessionData();
 
 //Setup the login page if we are using authentication
-if(config.UseAuthentication){
+if (config.enableAuthentication) {
 	if(config.EnableWebserver) {
 		app.get('/login', function(req, res){
 			res.sendFile(__dirname + '/login.htm');
@@ -212,6 +246,11 @@ if(config.UseAuthentication){
 			res.redirect(redirectTo);
 		}
 	);
+
+  app.get('/logout', function (req, res) {
+    req.logout();
+    res.sendFile(__dirname + '/login.html');
+  });
 }
 
 if(config.EnableWebserver) {
@@ -258,13 +297,19 @@ if(config.EnableWebserver) {
 }
 
 //Setup http and https servers
-http.listen(httpPort, function () {
-	console.logColor(logging.Green, 'Http listening on *: ' + httpPort);
+if (!config.enableHttps) {
+  http.listen(config.signallingServerPort, function () {
+    console.logColor(
+      logging.Green,
+      'Http listening on *: ' + config.signallingServerPort
+    );
 });
-
-if (config.UseHTTPS) {
-	https.listen(httpsPort, function () {
-		console.logColor(logging.Green, 'Https listening on *: ' + httpsPort);
+} else {
+  https.listen(config.signallingServerPort, function () {
+    console.logColor(
+      logging.Green,
+      'Https listening on *: ' + config.signallingServerPort
+    );
 	});
 }
 
@@ -341,6 +386,7 @@ streamerServer.on('connection', function (ws, req) {
 
 	console.logColor(logging.Green, `Streamer connected: ${req.connection.remoteAddress}`);
 	sendStreamerConnectedToMatchmaker();
+  ai.logMetric('SSStreamerConnected', 1); //////// AZURE ////////
 
 	ws.on('message', (msgRaw) => {
 
@@ -394,6 +440,7 @@ streamerServer.on('connection', function (ws, req) {
 	function onStreamerDisconnected() {
 		sendStreamerDisconnectedToMatchmaker();
 		disconnectAllPlayers();
+		ai.logMetric('SSStreamerDisconnected', 1); //////// AZURE ////////
 		if (sfuIsConnected()) {
 			const msg = { type: "streamerDisconnected" };
 			sfu.send(JSON.stringify(msg));
@@ -539,6 +586,7 @@ playerServer.on('connection', function (ws, req) {
 	let playerId = (++nextPlayerId).toString();
 	console.logColor(logging.Green, `player ${playerId} (${req.connection.remoteAddress}) connected`);
 	players.set(playerId, { ws: ws, id: playerId });
+  ai.logMetric('SSPlayerConnected', 1); //////// AZURE ////////
 
 	function sendPlayersCount() {
 		let playerCountMsg = JSON.stringify({ type: 'playerCount', count: players.size });
@@ -554,6 +602,9 @@ playerServer.on('connection', function (ws, req) {
 			msg = JSON.parse(msgRaw);
 		} catch (err) {
 			console.error(`cannot parse player ${playerId} message: ${msgRaw}\nError: ${err}`);
+			/////////////////////////////// AZURE ///////////////////////////////
+      		ai.logMetric('SignalingServerError', 1);
+      		ai.logError(err);
 			ws.close(1008, 'Cannot parse');
 			return;
 		}
@@ -590,19 +641,51 @@ playerServer.on('connection', function (ws, req) {
 		}
 	});
 
-	function onPlayerDisconnected() {
+  //////////////////////////// MSFT Improvement  ////////////////////////////
+  // Added for the ability to restart the app once a user closes their session,
+  // this way the next user doesn't see where the player last left off.
+  // This calls a custom OnClientDisconnected.ps1 script to close and restart the app.
+  function restartUnrealApp() {
+    // Call the restart PowerShell script only if all players have disconnected
+    if (players.size == 0) {
 		try {
-			--playerCount;
-			const player = players.get(playerId);
-			if (player.datachannel) {
-				// have to notify the streamer that the datachannel can be closed
-				sendMessageToController({ type: 'playerDisconnected', playerId: playerId }, true, false);
+        var spawn = require('child_process').spawn,
+          child;
+        // TODO: Need to pass in a config path to this for more robustness and not hard coded
+        child = spawn('powershell.exe', [
+          `C:\\Unreal_${config.version}\\scripts\\OnClientDisconnected.ps1 ${config.unrealAppName} ${config.streamerPort}`,
+        ]);
+
+        child.stdout.on('data', function (data) {
+          console.log('PowerShell Data: ' + data);
+        });
+        child.stderr.on('data', function (data) {
+          console.log('PowerShell Errors: ' + data);
+        });
+        child.on('exit', function () {
+          console.log('The PowerShell script complete.');
+        });
+        child.stdin.end();
+      } catch (e) {
+        console.log(
+          `ERROR: Errors executing PowerShell with message: ${e.toString()}`
+        );
+        ai.logError(e); //////// AZURE ////////
 			}
+    }
+  }
+  ///////////////////////////////////////////////////////////////////////////
+
+  function onPlayerDisconnected() {
+    try {
+      console.log('calling onPlayerDisconnected...');
 			players.delete(playerId);
 			sendMessageToController({ type: 'playerDisconnected', playerId: playerId }, skipSFU);
 			sendPlayerDisconnectedToFrontend();
 			sendPlayerDisconnectedToMatchmaker();
 			sendPlayersCount();
+      			console.log('CALLED onPlayerDisconnected');
+      			ai.logMetric('SSPlayerDisconnected', 1); //////// AZURE ////////
 		} catch(err) {
 			console.logColor(logging.Red, `ERROR:: onPlayerDisconnected error: ${err.message}`);
 		}
@@ -611,6 +694,11 @@ playerServer.on('connection', function (ws, req) {
 	ws.on('close', function(code, reason) {
 		console.logColor(logging.Yellow, `player ${playerId} connection closed: ${code} - ${reason}`);
 		onPlayerDisconnected();
+
+    //////////////////////////// MSFT Improvement  ////////////////////////////
+    // When a player session closes, kick off a restart for the Unreal app
+    setTimeout(restartUnrealApp, 500);
+    ///////////////////////////////////////////////////////////////////////////
 	});
 
 	ws.on('error', function(error) {
@@ -654,12 +742,19 @@ function disconnectSFUPlayer() {
  * Function that handles the connection to the matchmaker.
  */
 
+function safeWrite(socket, msg) {
+  if (!socket.connecting) {
+    socket.write(msg);
+  }
+}
+
 if (config.UseMatchmaker) {
 	var matchmaker = new net.Socket();
 
 	matchmaker.on('connect', function() {
 		console.log(`Cirrus connected to Matchmaker ${matchmakerAddress}:${matchmakerPort}`);
 
+    //////////////////////////// MSFT Improvement  ////////////////////////////
 		// message.playerConnected is a new variable sent from the SS to help track whether or not a player 
 		// is already connected when a 'connect' message is sent (i.e., reconnect). This happens when the MM
 		// and the SS get disconnected unexpectedly (was happening often at scale for some reason).
@@ -673,30 +768,40 @@ if (config.UseMatchmaker) {
 		// Add the new playerConnected flag to the message body to the MM
 		message = {
 			type: 'connect',
-			address: typeof serverPublicIp === 'undefined' ? '127.0.0.1' : serverPublicIp,
-			port: httpPort,
+			address:
+			typeof serverPublicIp === 'undefined'
+			? '127.0.0.1'
+			: serverPublicIp,
+			port: config.signallingServerPort,
 			ready: streamer && streamer.readyState === 1,
-			playerConnected: playerConnected
+      playerConnected: playerConnected,
+      version: config.version,
+      enableHttps: config.enableHttps
 		};
+    //////////////////////////// MSFT Improvement  ////////////////////////////
 
-		matchmaker.write(JSON.stringify(message));
+    	safeWrite(matchmaker, JSON.stringify(message));
+    	ai.logMetric('SSMatchmakerConnected', 1); //////// AZURE ////////
 	});
 
 	matchmaker.on('error', (err) => {
 		console.log(`Matchmaker connection error ${JSON.stringify(err)}`);
+    		ai.logMetric('SSMatchmakerConnectionError', 1); //////// AZURE ////////
 	});
 
 	matchmaker.on('end', () => {
 		console.log('Matchmaker connection ended');
+   		ai.logMetric('SSMatchmakerConnectionEnded', 1); //////// AZURE ////////
 	});
 
 	matchmaker.on('close', (hadError) => {
 		console.logColor(logging.Blue, 'Setting Keep Alive to true');
-        matchmaker.setKeepAlive(true, 60000); // Keeps it alive for 60 seconds
+		matchmaker.setKeepAlive(true, 60000); // Keeps it alive for 60 seconds
 		
 		console.log(`Matchmaker connection closed (hadError=${hadError})`);
 
 		reconnect();
+    		ai.logMetric('SSMatchmakerConnectionClosed', 1); //////// AZURE ////////
 	});
 
 	// Attempt to connect to the Matchmaker
@@ -706,7 +811,10 @@ if (config.UseMatchmaker) {
 
 	// Try to reconnect to the Matchmaker after a given period of time
 	function reconnect() {
-		console.log(`Try reconnect to Matchmaker in ${matchmakerRetryInterval} seconds`)
+    console.log(
+      `Try reconnect to Matchmaker in ${matchmakerRetryInterval} seconds`
+    );
+    ai.logMetric('SSMatchmakerRetryConnection', 1); //////// AZURE ////////
 		setTimeout(function() {
 			connect();
 		}, matchmakerRetryInterval * 1000);
@@ -717,7 +825,9 @@ if (config.UseMatchmaker) {
 			message = {
 				type: 'ping'
 			};
-			matchmaker.write(JSON.stringify(message));
+      // if the socket is in state 'connecting' we dont want to send this message. 
+      // This happens when MM is down for instance for new version
+      		safeWrite(matchmaker, JSON.stringify(message));
 		}, matchmakerKeepAliveInterval * 1000);
 	}
 
@@ -852,6 +962,7 @@ function sendPlayerDisconnectedToFrontend() {
 			function (response, body) {
 				if (response.statusCode === 200) {
 					console.log('clientDisconnected acknowledged by Frontend');
+					ai.logMetric('SSPlayerDisconnectedFrontEnd', 1); //////// AZURE ////////			
 				}
 				else {
 					console.error('Status code: ' + response.statusCode);
@@ -881,7 +992,7 @@ function sendStreamerConnectedToMatchmaker() {
 		message = {
 			type: 'streamerConnected'
 		};
-		matchmaker.write(JSON.stringify(message));
+    safeWrite(matchmaker, JSON.stringify(message));
 	} catch (err) {
 		console.logColor(logging.Red, `ERROR sending streamerConnected: ${err.message}`);
 	}
@@ -897,7 +1008,7 @@ function sendStreamerDisconnectedToMatchmaker() {
 		message = {
 			type: 'streamerDisconnected'
 		};
-		matchmaker.write(JSON.stringify(message));	
+    safeWrite(matchmaker, JSON.stringify(message));
 	} catch (err) {
 		console.logColor(logging.Red, `ERROR sending streamerDisconnected: ${err.message}`);
 	}
@@ -912,7 +1023,7 @@ function sendPlayerConnectedToMatchmaker() {
 		message = {
 			type: 'clientConnected'
 		};
-		matchmaker.write(JSON.stringify(message));
+    safeWrite(matchmaker, JSON.stringify(message));
 	} catch (err) {
 		console.logColor(logging.Red, `ERROR sending clientConnected: ${err.message}`);
 	}
@@ -927,7 +1038,7 @@ function sendPlayerDisconnectedToMatchmaker() {
 		message = {
 			type: 'clientDisconnected'
 		};
-		matchmaker.write(JSON.stringify(message));
+    safeWrite(matchmaker, JSON.stringify(message));
 	} catch (err) {
 		console.logColor(logging.Red, `ERROR sending clientDisconnected: ${err.message}`);
 	}

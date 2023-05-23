@@ -2,15 +2,48 @@
 var enableRedirectionLinks = true;
 var enableRESTAPI = true;
 
+// Microsoft Notes: This file has additions to the Unreal Engine Matchmaker that were done in conjuction with Epic to
+// add improved capabilities, resiliency and abilities to deploy and scale Pixel Streaming in Azure.
+// "MSFT Improvement" -- Areas where Microsoft have added additional code to what is exported out of Unreal Engine
+// "AZURE" -- Areas where Azure specific code was added (i.e., modules/azure.js, scale up/down, logging, metrics, etc.)
+
+//////////////////////////// MSFT Improvement  ////////////////////////////	
+// Added a config file for Matchmaker (MM)
 const defaultConfig = {
 	// The port clients connect to the matchmaking service over HTTP
-	HttpPort: 80,
-	UseHTTPS: false,
+	httpPort: 90,
+	httpsPort: 443,
+	enableHttps: false,
 	// The matchmaking port the signaling service connects to the matchmaker
-	MatchmakerPort: 9999,
+	matchmakerPort: 9999,
 
+	/////////////////////////////// AZURE ///////////////////////////////	
+	// The amount of instances deployed per node, to be used in the autoscale policy (i.e., 1 unreal app running per GPU VM) -- FUTURE
+	instancesPerNode: 1,
+	// The amount of available signaling service / App instances we want to ensure are available before we have to scale up (0 will ignore)
+	instanceCountBuffer: 5,
+	// The percentage amount of available signaling service / App instances we want to ensure are available before we have to scale up (0 will ignore)
+	percentBuffer: 25,
+	// The minimum number of available app instances we want to scale down to during an idle period
+	minInstanceCount: 0,
+	// The total amount of VMSS nodes that we will approve scaling up to
+	maxInstanceCount: 500,
+	// The subscription used for autoscaling policy
+	subscriptionId: "",
+	// The Azure ResourceGroup where the Azure VMSS is located, used for autoscaling
+	resourceGroup: "",
+	// The Azure VMSS name used for scaling the Signaling Service / Unreal App compute
+	virtualMachineScaleSet: "",
+	// Azure App Insights ID for logging
+	appInsightsInstrumentationKey: "",
 	// Log to file
-	LogToFile: true
+	LogToFile: true,
+	// Number of seconds between scaling evaluations
+	scalingEvaluationInterval: 30,
+	// Lifecycle managemnent enabled
+	enableLifecycleManagement: false
+	/////////////////////////////////////////////////////////////////////
+
 };
 
 // Similar to the Signaling Server (SS) code, load in a config.json file for the MM parameters
@@ -20,6 +53,7 @@ var configFile = (typeof argv.configFile != 'undefined') ? argv.configFile.toStr
 console.log(`configFile ${configFile}`);
 const config = require('./modules/config.js').init(configFile, defaultConfig);
 console.log("Config: " + JSON.stringify(config, null, '\t'));
+///////////////////////////////////////////////////////////////////////////
 
 const express = require('express');
 var cors = require('cors');
@@ -34,6 +68,29 @@ if (config.LogToFile) {
 	logging.RegisterFileLogger('./logs');
 }
 
+/////////////////////////////// AZURE ///////////////////////////////
+// Initialize the Azure module for scale and metric functionality
+const ai = require('./modules/ai.js')
+ai.init(config);
+const autoscale = require('./modules/autoscale.js')
+const connectionMgr = require('./modules/connectionManager.js');
+if(config.enableLifecycleManagement) {
+	require('./modules/api.js').init(config, ai);
+	require('./modules/lifecycleCheck.js').init(config, ai);
+}
+
+autoscale.init(config, ai);
+connectionMgr.init(ai);
+
+// Added for health check of the VM/App when using Azure Traffic Manager
+app.get('/ping', (req, res) => {
+	res.send('ping');
+});
+/////////////////////////////////////////////////////////////////////
+
+// Setup public folder
+app.use(express.static(path.join(__dirname, '/public')));
+
 // A list of all the Cirrus server which are connected to the Matchmaker.
 var cirrusServers = new Map();
 
@@ -41,19 +98,21 @@ var cirrusServers = new Map();
 // Parse command line.
 //
 
-if (typeof argv.HttpPort != 'undefined') {
-	config.HttpPort = argv.HttpPort;
+if (typeof argv.httpPort != 'undefined') {
+	config.httpPort = argv.httpPort;
 }
-if (typeof argv.MatchmakerPort != 'undefined') {
-	config.MatchmakerPort = argv.MatchmakerPort;
+if (typeof argv.matchmakerPort != 'undefined') {
+	config.matchmakerPort = argv.matchmakerPort;
 }
 
-http.listen(config.HttpPort, () => {
-    console.log('HTTP listening on *:' + config.HttpPort);
+http.listen(config.httpPort, () => {
+    console.log('HTTP listening on *:' + config.httpPort);
 });
 
 
-if (config.UseHTTPS) {
+//////////////////////////// MSFT Improvement  ////////////////////////////	
+// Added HTTPS code for Matchmaker from SS (due to some corporate policies requiring it)
+if (config.enableHttps) {
 	//HTTPS certificate details
 	const options = {
 		key: fs.readFileSync(path.join(__dirname, './certificates/client-key.pem')),
@@ -69,7 +128,7 @@ if (config.UseHTTPS) {
 			if (req.get('Host')) {
 				var hostAddressParts = req.get('Host').split(':');
 				var hostAddress = hostAddressParts[0];
-				if (httpsPort != 443) {
+				if (config.httpsPort != 443) {
 					hostAddress = `${hostAddress}:${httpsPort}`;
 				}
 				return res.redirect(['https://', hostAddress, req.originalUrl].join(''));
@@ -85,6 +144,8 @@ if (config.UseHTTPS) {
 		console.log('Https listening on 443');
 	});
 }
+///////////////////////////////////////////////////////////////////////////
+
 
 // No servers are available so send some simple JavaScript to the client to make
 // it retry after a short period of time.
@@ -108,14 +169,15 @@ function getAvailableCirrusServer() {
 	for (cirrusServer of cirrusServers.values()) {
 		if (cirrusServer.numConnectedClients === 0 && cirrusServer.ready === true) {
 
-			// Check if we had at least 10 seconds since the last redirect, avoiding the 
+			//////////////////////////// MSFT Improvement  ////////////////////////////	
+			// Check if we had at least 45 seconds since the last redirect, avoiding the 
 			// chance of redirecting 2+ users to the same SS before they click Play.
-			// In other words, give the user 10 seconds to click play button the claim the server.
-			if( cirrusServer.hasOwnProperty('lastRedirect')) {
-				if( ((Date.now() - cirrusServer.lastRedirect) / 1000) < 10 )
+			if( cirrusServer.lastRedirect ) {
+				if( ((Date.now() - cirrusServer.lastRedirect) / 1000) < 45 )
 					continue;
 			}
 			cirrusServer.lastRedirect = Date.now();
+			///////////////////////////////////////////////////////////////////////////
 
 			return cirrusServer;
 		}
@@ -144,7 +206,7 @@ if(enableRedirectionLinks) {
 	app.get('/', (req, res) => {
 		cirrusServer = getAvailableCirrusServer();
 		if (cirrusServer != undefined) {
-			res.redirect(`http://${cirrusServer.address}:${cirrusServer.port}/`);
+			res.redirect(`${cirrusServer.enableHttps ? 'https' : 'http' }://${cirrusServer.address}:${cirrusServer.port}/`);
 			//console.log(req);
 			console.log(`Redirect to ${cirrusServer.address}:${cirrusServer.port}`);
 		} else {
@@ -156,8 +218,8 @@ if(enableRedirectionLinks) {
 	app.get('/custom_html/:htmlFilename', (req, res) => {
 		cirrusServer = getAvailableCirrusServer();
 		if (cirrusServer != undefined) {
-			res.redirect(`http://${cirrusServer.address}:${cirrusServer.port}/custom_html/${req.params.htmlFilename}`);
-			console.log(`Redirect to ${cirrusServer.address}:${cirrusServer.port}`);
+			res.redirect(`${cirrusServer.enableHttps ? 'https' : 'http' }://${cirrusServer.address}:${cirrusServer.port}/custom_html/${req.params.htmlFilename}`);
+			console.log(`Redirect to ${cirrusServer.enableHttps ? 'https' : 'http' }://${cirrusServer.address}:${cirrusServer.port}`);
 		} else {
 			sendRetryResponse(res);
 		}
@@ -185,6 +247,7 @@ const matchmaker = net.createServer((connection) => {
 		} catch(e) {
 			console.log(`ERROR (${e.toString()}): Failed to parse Cirrus information from data: ${data.toString()}`);
 			disconnect(connection);
+			ai.logError(e);   //////// AZURE ////////
 			return;
 		}
 		if (message.type === 'connect') {
@@ -193,10 +256,13 @@ const matchmaker = net.createServer((connection) => {
 				address: message.address,
 				port: message.port,
 				numConnectedClients: 0,
-				lastPingReceived: Date.now()
+				lastPingReceived: Date.now(),
+				version: message.version,
+				enableHttps: message.enableHttps
 			};
 			cirrusServer.ready = message.ready === true;
 
+			//////////////////////////// MSFT Improvement  ////////////////////////////	
 			// Handles disconnects between MM and SS to not add dupes with numConnectedClients = 0 and redirect users to same SS
 			// Check if player is connected and doing a reconnect. message.playerConnected is a new variable sent from the SS to
 			// help track whether or not a player is already connected when a 'connect' message is sent (i.e., reconnect).
@@ -209,7 +275,7 @@ const matchmaker = net.createServer((connection) => {
 
 			// if a duplicate server with the same address isn't found -- add it to the map as an available server to send users to.
 			if (!server || server.size <= 0) {
-				console.log(`Adding connection for ${cirrusServer.address.split(".")[0]} with playerConnected: ${message.playerConnected}`)
+				console.log(`Adding connection for ${cirrusServer.address.split(".")[0]} with playerConnected: ${message.playerConnected} and version: ${message.version}`)
 				cirrusServers.set(connection, cirrusServer);
             } else {
 				console.log(`RECONNECT: cirrus server address ${cirrusServer.address.split(".")[0]} already found--replacing. playerConnected: ${message.playerConnected}`)
@@ -224,14 +290,27 @@ const matchmaker = net.createServer((connection) => {
 					cirrusServers.set(connection, cirrusServer);
 					console.log("Connection not found in Map() -- adding a new one");
 				}
+
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("DuplicateCirrusConnection", 1);
+				ai.logEvent("DuplicateCirrusConnection", message.address);
 			}
+			///////////////////////////////////////////////////////////////////////////
+
 		} else if (message.type === 'streamerConnected') {
 			// The stream connects to a Cirrus server and so is ready to be used
 			cirrusServer = cirrusServers.get(connection);
 			if(cirrusServer) {
 				cirrusServer.ready = true;
 				console.log(`Cirrus server ${cirrusServer.address}:${cirrusServer.port} ready for use`);
+
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("StreamerConnected", 1);						
+				ai.logEvent("StreamerConnected", cirrusServer.address);	
 			} else {
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("CirrusServerUndefined", 1);					
+				ai.logEvent("CirrusServerUndefined", `No cirrus server found on streamer connect: ${connection.remoteAddress}`);
 				disconnect(connection);
 			}
 		} else if (message.type === 'streamerDisconnected') {
@@ -240,7 +319,14 @@ const matchmaker = net.createServer((connection) => {
 			if(cirrusServer) {
 				cirrusServer.ready = false;
 				console.log(`Cirrus server ${cirrusServer.address}:${cirrusServer.port} no longer ready for use`);
+
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("StreamerDisconnected", 1);
+				ai.logEvent("StreamerDisconnected", cirrusServer.address);
 			} else {
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("CirrusServerUndefined", 1);
+				ai.logEvent("CirrusServerUndefined", `No cirrus server found on streamer disconnect: ${connection.remoteAddress}`);
 				disconnect(connection);
 			}
 		} else if (message.type === 'clientConnected') {
@@ -249,7 +335,15 @@ const matchmaker = net.createServer((connection) => {
 			if(cirrusServer) {
 				cirrusServer.numConnectedClients++;
 				console.log(`Client connected to Cirrus server ${cirrusServer.address}:${cirrusServer.port}`);
+
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("ClientConnection", 1);
+				ai.logEvent("ClientConnection", cirrusServer.address);
 			} else {
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("CirrusServerUndefined", 1);
+				ai.logEvent("CirrusServerUndefined", `No cirrus server found on client connect: ${connection.remoteAddress}`);
+
 				disconnect(connection);
 			}
 		} else if (message.type === 'clientDisconnected') {
@@ -263,6 +357,10 @@ const matchmaker = net.createServer((connection) => {
 					cirrusServer.lastRedirect = 0;
 				}
 			} else {				
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("CirrusServerUndefined", 1);
+				ai.logEvent("CirrusServerUndefined", `No cirrus server found on client disconnect: ${connection.remoteAddress}`);
+
 				disconnect(connection);
 			}
 		} else if (message.type === 'ping') {
@@ -270,12 +368,24 @@ const matchmaker = net.createServer((connection) => {
 			if(cirrusServer) {
 				cirrusServer.lastPingReceived = Date.now();
 			} else {				
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("CirrusServerUndefined", 1);
+				ai.logEvent("CirrusServerUndefined", `No cirrus server found on client disconnect: ${connection.remoteAddress}`);
+
 				disconnect(connection);
 			}
 		} else {
 			console.log('ERROR: Unknown data: ' + JSON.stringify(message));
 			disconnect(connection);
+
+			/////////////////////////////// AZURE ///////////////////////////////	
+			ai.logMetric("MMBadMessageType", 1);
+			ai.logEvent("MMBadMessageType", JSON.stringify(message));
 		}
+
+		/////////////////////////////// AZURE ///////////////////////////////	
+		// Use the Azure Module to evaluate whether or not we should scale/up down the VMSS compute for streams
+		registerAndDoScaleEval();
 	});
 
 	// A Cirrus server disconnects from this Matchmaker server.
@@ -284,12 +394,35 @@ const matchmaker = net.createServer((connection) => {
 		if(cirrusServer) {
 			cirrusServers.delete(connection);
 			console.log(`Cirrus server ${cirrusServer.address}:${cirrusServer.port} disconnected from Matchmaker`);
+
+			/////////////////////////////// AZURE ///////////////////////////////	
+			ai.logEvent("MMCirrusDisconnect", `Cirrus server ${cirrusServer.address}:${cirrusServer.port} disconnected from Matchmaker`);
 		} else {
 			console.log(`Disconnected machine that wasn't a registered cirrus server, remote address: ${connection.remoteAddress}`);
+
+			/////////////////////////////// AZURE ///////////////////////////////	
+			ai.logEvent("MMCirrusDisconnect", `Disconnected machine that wasn't a registered cirrus server, remote address: ${connection.remoteAddress}`);
 		}
+
+		/////////////////////////////// AZURE ///////////////////////////////	
+		ai.logMetric("MMCirrusDisconnect", 1);
 	});
 });
 
 matchmaker.listen(config.MatchmakerPort, () => {
 	console.log('Matchmaker listening on *:' + config.MatchmakerPort);
 });
+
+var scaleEvalRegistered = false;
+function registerAndDoScaleEval()
+{
+	// situation can occur that scaling rules are ignored (scale process in progress)
+	// therefore we register this Interval to do periodic checking if scaling is needed
+	if(!scaleEvalRegistered) {
+		scaleEvalRegistered = true;
+		setInterval(function() {
+			if(config.enableAutoScale) autoscale.evaluateAutoScalePolicy(cirrusServers);
+			connectionMgr.checkIfNodesAreStillResponsive(cirrusServers);
+		}, config.scalingEvaluationInterval * 1000);
+	}
+}
