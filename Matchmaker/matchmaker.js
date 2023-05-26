@@ -49,7 +49,7 @@ const defaultConfig = {
 // Similar to the Signaling Server (SS) code, load in a config.json file for the MM parameters
 const argv = require('yargs').argv;
 
-var configFile = (typeof argv.configFile != 'undefined') ? argv.configFile.toString() : 'config.json';
+var configFile = (typeof argv.configFile != 'undefined') ? argv.configFile.toString() : '.\\config.json';
 console.log(`configFile ${configFile}`);
 const config = require('./modules/config.js').init(configFile, defaultConfig);
 console.log("Config: " + JSON.stringify(config, null, '\t'));
@@ -208,7 +208,7 @@ if(enableRedirectionLinks) {
 		if (cirrusServer != undefined) {
 			res.redirect(`${cirrusServer.enableHttps ? 'https' : 'http' }://${cirrusServer.address}:${cirrusServer.port}/`);
 			//console.log(req);
-			console.log(`Redirect to ${cirrusServer.address}:${cirrusServer.port}`);
+			console.log(`Redirect to ${cirrusServer.enableHttps ? 'https' : 'http' }://${cirrusServer.address}:${cirrusServer.port}`);
 		} else {
 			sendRetryResponse(res);
 		}
@@ -352,6 +352,10 @@ const matchmaker = net.createServer((connection) => {
 			if(cirrusServer) {
 				cirrusServer.numConnectedClients--;
 				console.log(`Client disconnected from Cirrus server ${cirrusServer.address}:${cirrusServer.port}`);
+
+				/////////////////////////////// AZURE ///////////////////////////////	
+				ai.logMetric("ClientDisconnected", 1);
+				ai.logEvent("ClientDisconnected", cirrusServer.address);
 				if(cirrusServer.numConnectedClients === 0) {
 					// this make this server immediately available for a new client
 					cirrusServer.lastRedirect = 0;
@@ -409,8 +413,8 @@ const matchmaker = net.createServer((connection) => {
 	});
 });
 
-matchmaker.listen(config.MatchmakerPort, () => {
-	console.log('Matchmaker listening on *:' + config.MatchmakerPort);
+matchmaker.listen(config.matchmakerPort, () => {
+	console.log('Matchmaker listening on *:' + config.matchmakerPort);
 });
 
 var scaleEvalRegistered = false;
