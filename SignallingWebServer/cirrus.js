@@ -264,7 +264,6 @@ if (config.enableAuthentication) {
 }
 
 if(config.EnableWebserver) {
-	app.use(allowCrossDomain);
 	//Setup folders
 	app.use(express.static(path.join(__dirname, '/Public')))
 	app.use('/images', express.static(path.join(__dirname, './images')))
